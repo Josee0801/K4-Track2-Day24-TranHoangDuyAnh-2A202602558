@@ -1,0 +1,8 @@
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks-system
+        name: gitleaks git history
+        entry: gitleaks git --config .gitleaks.toml --redact --verbose .
+        pass_filenames: false
