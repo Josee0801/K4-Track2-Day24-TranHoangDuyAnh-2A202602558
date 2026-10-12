@@ -1,40 +1,18 @@
-"""BƯỚC 3b — PEP (Policy Enforcement Point) tại tool call (15').
+"""CP3b - policy checks for tool calls.
 
-Cổng chặn TRƯỚC KHI tool thật sự execute. Đọc CHECKPOINTS.md (§3b).
-
-Interface bắt buộc (tests/test_policy.py và agent/runner.py gọi trực tiếp):
-
-    check(context: PolicyContext) -> tuple[bool, str]
-        Trả về (allow, reason).
-        `reason` KHÔNG BAO GIỜ được để trống — cả khi allow=True và
-        allow=False. Đây là evidence audit ở Bước 4 (rubric: "Audit
-        completeness = 100%" — điều kiện trượt nếu có dòng thiếu reason).
-
-PolicyContext — 5 input gốc và các input OBO cho lớp L3:
-
-    data_classification: str   "public" | "internal" | "restricted"
-    request_purpose: str       tự do, ví dụ "reconciliation", "support-reply"
-    agent_owner: str            định danh agent/run gọi tool này
-    delegation_depth: int       0 = gọi trực tiếp bởi user, >0 = agent gọi agent
-    egress_enabled: bool        run hiện tại có được phép gọi network không
-    principal_id: str           ID người ra lệnh từ data/principals.json
-    requested_tool: str         tool sắp gọi
-    agent_scopes: tuple[str]    quyền tối đa của agent
-    parent_scopes: tuple[str]   quyền của agent cha khi delegation_depth > 0
-    expires_at: str             ISO-8601 UTC; hết hạn phải deny
-
-Rule TỐI THIỂU bắt buộc (không được viết yếu hơn rule này):
-
-    classification == "restricted" and egress_enabled is True  ->  DENY
-
-Checkpoint OBO: quyền hiệu lực = principal.allowed_tools ∩ agent_scopes,
-và nếu depth > 0 thì còn giao với parent_scopes. Unknown principal, scope
-thiếu, run hết hạn đều deny kèm reason. Principal là fixture mô phỏng,
-không phải xác thực người dùng production.
+Every decision returns a non-empty reason so the runner can write complete
+audit entries for both allow and deny outcomes.
 """
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+PRINCIPALS_FILE = BASE_DIR / "data" / "principals.json"
 
 
 @dataclass(frozen=True)
@@ -51,5 +29,54 @@ class PolicyContext:
     expires_at: str = ""
 
 
+def _principals() -> dict:
+    return json.loads(PRINCIPALS_FILE.read_text(encoding="utf-8"))
+
+
+def _parse_expiry(value: str) -> datetime | None:
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def check(context: PolicyContext) -> tuple[bool, str]:
-    raise NotImplementedError("BƯỚC 3b: implement policy check")
+    """Return (allow, reason) for the requested tool call."""
+    if context.data_classification == "restricted" and context.egress_enabled:
+        return False, "restricted data cannot be used in an egress-enabled tool call"
+
+    if not context.principal_id:
+        return True, "allowed: no principal supplied for baseline policy context"
+
+    principals = _principals()
+    principal = principals.get(context.principal_id)
+    if principal is None:
+        return False, f"unknown principal: {context.principal_id}"
+
+    expires_at = _parse_expiry(context.expires_at)
+    if expires_at is None:
+        return False, "missing or invalid expires_at"
+    if expires_at <= datetime.now(timezone.utc):
+        return False, "authorization expired"
+
+    if context.request_purpose not in principal.get("purposes", []):
+        return False, f"purpose not allowed for principal: {context.request_purpose}"
+
+    requested_tool = context.requested_tool
+    if not requested_tool:
+        return False, "missing requested_tool"
+
+    allowed_tools = set(principal.get("allowed_tools", []))
+    effective_tools = allowed_tools & set(context.agent_scopes)
+    if context.delegation_depth > 0:
+        effective_tools &= set(context.parent_scopes)
+
+    if requested_tool not in effective_tools:
+        return False, f"tool not allowed by effective scopes: {requested_tool}"
+
+    return True, f"allowed {requested_tool} for {context.principal_id}"
